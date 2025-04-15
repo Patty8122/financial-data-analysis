@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+sqlalchemy
+sentence-transformers
+faiss-cpu
+numpy
+python-dotenv
+yfinance
+langchain_pinecone
+openai
+python-dotenv
+langchain-community
