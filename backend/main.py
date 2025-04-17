@@ -1,42 +1,38 @@
-import os
-import json
-import time
+from fastapi import FastAPI, HTTPException, Query
+from pydantic import BaseModel
+from typing import List
 import requests
+import json
 import yfinance as yf
-import numpy as np
-from fastapi import FastAPI, Query
-from fastapi.middleware.cors import CORSMiddleware
-from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
-from threading import Thread
+from langchain_community.embeddings import OpenAIEmbeddings
+from langchain_pinecone import PineconeVectorStore
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain.chains import RetrievalQA
+from langchain_community.chat_models import ChatOpenAI
+import os
+from dotenv import load_dotenv
+import concurrent.futures
+
+load_dotenv()
 
 # --- CONFIGURATION ---
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_ENV = os.getenv("PINECONE_ENV", "us-east-1")  # Unused in v3 SDK
-PINECONE_INDEX_NAME = "stock-ticker-nlp"
-EMBEDDING_MODEL = "sentence-transformers/all-mpnet-base-v2"
+PINECONE_ENV = os.getenv("PINECONE_ENV", "us-east-1")
+INDEX_NAME = "stock-ticker"
 TICKER_JSON_URL = "https://raw.githubusercontent.com/team-headstart/Financial-Analysis-and-Automation-with-LLMs/main/company_tickers.json"
-UPDATE_INTERVAL = 60 * 60 * 24  # 24 hours
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# --- FASTAPI APP ---
+# Initialize clients
+pc = Pinecone(api_key=PINECONE_API_KEY)
+
+
+embeddings = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+llm = ChatOpenAI(temperature=0, openai_api_key=OPENAI_API_KEY)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=500, chunk_overlap=50)
 app = FastAPI()
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
 
-# --- GLOBALS ---
-model = None
-pinecone_client = None
-pinecone_index = None
-ticker_cache = {}
-last_update_time = 0
-
-# --- UTILS ---
-
+# ========= UTILITY FUNCTIONS =========
 def get_company_tickers():
     response = requests.get(TICKER_JSON_URL)
     if response.status_code == 200:
@@ -46,110 +42,182 @@ def get_company_tickers():
         print(f"Failed to download tickers. Status code: {response.status_code}")
         return []
 
-def get_stock_info(symbol: str) -> dict:
+def fetch_ticker_description(ticker: str) -> str:
     try:
-        data = yf.Ticker(symbol)
-        stock_info = data.info
+        return yf.Ticker(ticker).info.get("longBusinessSummary", "")
+    except Exception as e:
+        print(f"Error fetching description for {ticker}: {e}")
+        return ""
+
+def upsert_to_pinecone(ticker: str, description: str):
+    if not description:
+        return 0
+    docs = text_splitter.create_documents([description], metadatas=[{"source": ticker, "text": description}])
+    vectorstore = PineconeVectorStore(
+        index=index,
+        embedding=embeddings,
+        text_key="text"
+    )
+    vectorstore.add_documents(docs)
+    return len(docs)
+
+def get_vectorstore():
+    return PineconeVectorStore(
+        index=index,
+        embedding=embeddings,
+        text_key="text"
+    )
+
+
+def populate_pinecone():
+    global index
+    tickers = get_company_tickers()
+    index = pc.Index(INDEX_NAME)
+
+
+    count = 0
+    batch_size = 50  # Process 50 tickers at a time
+    for i in range(0, len(tickers), batch_size):
+        batch = tickers[i:i + batch_size]
+        for ticker in batch:
+            desc = fetch_ticker_description(ticker)
+            if desc:
+                upsert_to_pinecone(ticker, desc)
+                count += 1
+                
+def populate_pinecone_concurrent(batch_size=50, max_workers=10):
+    global index
+    index = pc.Index(INDEX_NAME)
+    tickers = get_company_tickers()
+
+    print(f"Total tickers to upload: {len(tickers)}")
+
+    def process_batch(batch, batch_id):
+        local_count = 0
+        for ticker in batch:
+            desc = fetch_ticker_description(ticker)
+            if desc:
+                upsert_to_pinecone(ticker, desc)
+                local_count += 1
+        print(f"[✓] Processed batch {batch_id} with {local_count} tickers")
+
+    batches = [
+        tickers[i:i + batch_size]
+        for i in range(0, len(tickers), batch_size)
+    ]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(process_batch, batch, idx + 1)
+            for idx, batch in enumerate(batches)
+        ]
+        concurrent.futures.wait(futures)
+
+    print("✅ All ticker batches uploaded to Pinecone")
+
+# ========= MODELS =========
+class QueryModel(BaseModel):
+    query: str
+
+class TickerModel(BaseModel):
+    ticker: str
+
+# ========= ENDPOINTS =========
+@app.on_event("startup")
+def startup_event():
+    # populate pinecone with ticker descriptions
+    # use refresh endpoint to update pinecone
+    if INDEX_NAME not in pc.list_indexes().names():
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=1536,  # OpenAI embeddings dimension
+            metric="cosine",
+            spec= ServerlessSpec(
+                cloud="aws",
+                region=PINECONE_ENV
+            )
+        )
+        populate_pinecone_concurrent()
+    else:
+        print(f"Index {INDEX_NAME} already exists")
+        global index
+        index = pc.Index(INDEX_NAME)
+
+
+@app.post("/qna_search")
+def qna_search(payload: QueryModel):
+    try:
+        vectorstore = get_vectorstore()
+        chain = RetrievalQA.from_chain_type(llm=llm, retriever=vectorstore.as_retriever())
+        result = chain.run(payload.query)
+        return {"answer": result}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search error: {e}")
+
+@app.post("/text_search")
+def text_search(payload: QueryModel):
+    try:
+        vectorstore = get_vectorstore()
+        results = vectorstore.similarity_search(payload.query, k=5)
+        return [
+            {
+                "ticker": result.metadata.get("source"),
+                "description": result.page_content
+            }
+            for result in results
+        ]
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search error: {e}")
+
+@app.post("/refresh")
+def refresh():
+    # create index if it doesn't exist
+    try:
+        if INDEX_NAME in pc.list_indexes().names():
+            print(f"Index {INDEX_NAME} already exists")
+            # delete index
+            pc.delete_index(INDEX_NAME)
+        pc.create_index(
+            name=INDEX_NAME,
+            dimension=1536,  # OpenAI embeddings dimension
+            metric="cosine",
+            spec= ServerlessSpec(
+                cloud="aws",
+                region=PINECONE_ENV
+            )
+        )
+        populate_pinecone_concurrent()
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Refresh error: {e}")
+
+@app.post("/add_ticker_to_db")
+def add_ticker(payload: TickerModel):
+    try:
+        desc = fetch_ticker_description(payload.ticker)
+        if not desc:
+            raise HTTPException(status_code=404, detail="No description found.")
+        chunks = upsert_to_pinecone(payload.ticker, desc)
+        return {"ticker": payload.ticker, "chunks_indexed": chunks}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Add ticker error: {e}")
+
+@app.get("/ticker_info/{ticker_name}")
+def get_ticker_info(ticker_name: str):
+    try:
+        vectorstore = get_vectorstore()
+        results = vectorstore.similarity_search(
+            ticker_name,
+            filter={"source": ticker_name},
+            k=1
+        )
+        if not results:
+            raise HTTPException(status_code=404, detail=f"No information found for ticker {ticker_name}")
+        
         return {
-            "symbol": stock_info.get('symbol', symbol),
-            "name": stock_info.get('longName', ''),
-            "business_summary": stock_info.get('longBusinessSummary', ''),
-            "industry": stock_info.get('industry', ''),
-            "sector": stock_info.get('sector', ''),
-            "country": stock_info.get('country', ''),
+            "ticker": ticker_name,
+            "source": results[0].metadata.get("source"),
+            "text": results[0].page_content
         }
     except Exception as e:
-        print(f"Error fetching info for {symbol}: {e}")
-        return None
-
-def embed_text(text: str) -> np.ndarray:
-    return model.encode([text or ""])[0]
-
-def upsert_to_pinecone(symbol, embedding, metadata):
-    pinecone_index.upsert(vectors=[{
-        "id": symbol,
-        "values": embedding.tolist(),
-        "metadata": metadata
-    }])
-
-def refresh_ticker_data():
-    global ticker_cache, last_update_time
-    print("Refreshing ticker data...")
-    tickers = get_company_tickers()
-    for symbol in tickers:
-        info = get_stock_info(symbol)
-        if not info or not info["business_summary"]:
-            continue
-        if symbol not in ticker_cache or ticker_cache[symbol] != info:
-            embedding = embed_text(info["business_summary"])
-            upsert_to_pinecone(symbol, embedding, info)
-            ticker_cache[symbol] = info
-
-    # Remove deleted tickers
-    stats = pinecone_index.describe_index_stats().to_dict()
-    current_ids = set(stats.get("total_vector_count", []))
-    to_delete = list(current_ids - set(ticker_cache.keys()))
-    if to_delete:
-        pinecone_index.delete(ids=to_delete)
-
-    last_update_time = time.time()
-    print("Ticker data refresh complete.")
-
-def background_updater():
-    while True:
-        try:
-            refresh_ticker_data()
-        except Exception as e:
-            print(f"Background update error: {e}")
-        time.sleep(UPDATE_INTERVAL)
-
-# --- FASTAPI EVENTS ---
-
-@app.on_event("startup")
-def on_startup():
-    global model, pinecone_client, pinecone_index
-    model = SentenceTransformer(EMBEDDING_MODEL)
-    pinecone_client = Pinecone(api_key=PINECONE_API_KEY)
-
-    # Create index if needed
-    if PINECONE_INDEX_NAME not in pinecone_client.list_indexes().names():
-        pinecone_client.create_index(
-            name=PINECONE_INDEX_NAME,
-            dimension=768,
-            metric="cosine",
-            spec=ServerlessSpec(cloud="aws", region="us-east-1")  # Adjust as needed
-        )
-        # Wait for it to be ready
-        while pinecone_client.describe_index(PINECONE_INDEX_NAME).status['ready'] is False:
-            time.sleep(1)
-
-    pinecone_index = pinecone_client.Index(PINECONE_INDEX_NAME)
-    Thread(target=background_updater, daemon=True).start()
-
-# --- API ENDPOINTS ---
-
-@app.get("/health")
-def health():
-    return {"status": "healthy", "last_update": last_update_time}
-
-@app.get("/search/")
-def search(query: str = Query(..., description="Your search query"), k: int = 5):
-    query_emb = embed_text(query)
-    res = pinecone_index.query(vector=query_emb.tolist(), top_k=k, include_metadata=True)
-    results = []
-    for match in res["matches"]:
-        meta = match.get("metadata", {})
-        results.append({
-            "symbol": meta.get("symbol"),
-            "name": meta.get("name"),
-            "industry": meta.get("industry"),
-            "sector": meta.get("sector"),
-            "country": meta.get("country"),
-            "business_summary": meta.get("business_summary"),
-            "score": match.get("score"),
-        })
-    return {"results": results}
-
-@app.get("/tickers/")
-def get_tickers():
-    return {"tickers": list(ticker_cache.keys())}
+        raise HTTPException(status_code=500, detail=f"Error fetching ticker info: {e}")
