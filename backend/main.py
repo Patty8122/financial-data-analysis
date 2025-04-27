@@ -8,11 +8,14 @@ from pinecone import Pinecone, ServerlessSpec
 from langchain_community.embeddings import OpenAIEmbeddings
 from langchain_pinecone import PineconeVectorStore
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain.chains import RetrievalQA
-from langchain_community.chat_models import ChatOpenAI
+from langchain_openai import ChatOpenAI
 import os
 from dotenv import load_dotenv
 import concurrent.futures
+from langchain.chains import ConversationalRetrievalChain
+from langchain.memory import ConversationBufferMemory
+from typing import Optional
+from uuid import uuid4
 
 load_dotenv()
 
@@ -122,6 +125,10 @@ class QueryModel(BaseModel):
 class TickerModel(BaseModel):
     ticker: str
 
+class QnAQueryModel(BaseModel):
+    query: str
+    session_id: Optional[str] = None
+
 # ========= ENDPOINTS =========
 @app.on_event("startup")
 def startup_event():
@@ -143,14 +150,44 @@ def startup_event():
         global index
         index = pc.Index(INDEX_NAME)
 
-
+session_memory = {}
 @app.post("/qna_search")
-def qna_search(payload: QueryModel):
+def qna_search(payload: QnAQueryModel):
     try:
-        vectorstore = get_vectorstore()
-        chain = RetrievalQA.from_chain_type(llm=llm, retriever=vectorstore.as_retriever())
+        # Generate a session ID if not provided
+        session_id = payload.session_id or str(uuid4())
+
+        # Reuse or initialize memory
+        if session_id not in session_memory:
+            session_memory[session_id] = ConversationBufferMemory(
+                memory_key="chat_history",
+                return_messages=True
+            )
+
+        memory = session_memory[session_id]
+
+        # Get retriever
+        retriever = get_vectorstore().as_retriever()
+
+        # Create ConversationalRetrievalChain
+        chain = ConversationalRetrievalChain.from_llm(
+            llm=llm,
+            retriever=retriever,
+            memory=memory
+        )
+        
+        print(memory, "memory")
+        print(payload.query, "query")
+        print(chain, "chain")
+
+        # Run the query
         result = chain.run(payload.query)
-        return {"answer": result}
+
+        return {
+            "answer": result,
+            "session_id": session_id
+        }
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search error: {e}")
 
